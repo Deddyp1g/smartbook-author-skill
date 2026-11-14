@@ -1,6 +1,6 @@
 ---
 name: smartbook-author
-description: Create or adapt an interactive HTML smartbook that represents all chapters of an existing textbook and prepare its local resources for upload to the Smart Textbook platform.
+description: Create or adapt an interactive HTML smartbook for an existing textbook, package it, and upload it to the specified Smart Textbook book when requested.
 ---
 
 # Smartbook author
@@ -12,6 +12,7 @@ Create an interactive presentation of the same textbook, not a new textbook or a
 3. Deliver static HTML, CSS, JavaScript and resources, with `index.html` at the package root and relative local references. Avoid remote CDNs and runtime services unless the platform explicitly allows them. Keep source files and generated distribution separate. Do not include source textbooks, credentials, development artifacts or unused media in the upload unless the author explicitly intends to distribute them.
 4. Preview the actual distribution in a browser at desktop and mobile sizes. Exercise chapter navigation, search, interactions, animation, reload, keyboard access and storage-unavailable fallback; inspect console and failed requests. Compare every source chapter against the chapter map. Record any limitations rather than claiming untested behavior.
 5. Read [the package guide](references/package.md), then run the bundled tool to pack and validate the actual distribution. Resolve `scripts/smartbook.py` relative to the directory containing this `SKILL.md`; do not assume the current working directory is the skill directory. Run the script with `--help` for commands. The local check is advisory: the platform's deterministic validation and security checks and administrator's manual publication review are authoritative.
+6. When the author requests an upload, read [the upload guide](references/upload.md). Obtain the target book ID and platform origin from the author or trustworthy project context; use the author API key supplied through `SMARTBOOK_API_KEY`. Run the bundled upload tool on the validated ZIP. Report the returned asset ID and actual status, and retain the idempotency key for any uncertain outcome. Upload only to the specified existing book; never approve or publish the upload as part of this step.
 
 The current reader does not provide a storage bridge, and native `localStorage` may be unavailable. Make the book usable without persisted preferences. For the experimental client and its limitations, read [the storage guide](references/storage.md); do not rely on it until the target reader explicitly supports and verifies the protocol.
 

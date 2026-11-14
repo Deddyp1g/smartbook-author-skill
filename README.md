@@ -54,6 +54,14 @@ python skills/smartbook-author/scripts/smartbook.py validate /path/to/smartbook.
 
 以上命令从本仓库根目录运行；如果安装在别处，请将脚本路径改为已安装技能中的路径。脚本只做有限的本地静态检查，不能证明网页安全、章节完整或一定通过平台上传；不能替代平台的确定性检查和管理员人工审核。平台的限制、审核结果和实际发布流程以部署版本为准。需有 Python 3.9 或更新版本；脚本无需安装额外依赖。
 
+作者要求上传时，将具备目标教材编辑权限的 API Key 安全地提供给 harness 进程的 `SMARTBOOK_API_KEY` 环境变量，然后指定已有教材 ID 和平台地址：
+
+```bash
+python skills/smartbook-author/scripts/upload.py /path/to/smartbook.zip --book-id 123 --base-url http://example.com:5173
+```
+
+不要在命令参数、项目文件或聊天中填写密钥。上传工具先校验同一份 ZIP 快照，只执行上传，不自动审核或发布；上传成功后的状态以返回值为准。HTTP 会在网络中明文传输密钥和文件；上传工具同时支持 HTTPS，SSH 隧道、断线后的幂等重试和授权范围详见 [上传指南](skills/smartbook-author/references/upload.md)。平台也必须已部署支持 API Key 的上传接口。
+
 当前智慧书阅读器未启用存储桥，原生 `localStorage` 也可能不可用；智慧书应在不能保存主题和阅读位置时仍可正常使用。随技能保留的存储客户端仅供未来支持该协议时实验，不能作为当前阅读器的持久化方案；详见 [存储说明](skills/smartbook-author/references/storage.md)。
 
 开发者可在仓库根目录运行 `python -m unittest discover -s tests -v` 和 `node --test tests/test_storage.cjs` 验证打包工具和存储客户端；后者需要 Node.js。

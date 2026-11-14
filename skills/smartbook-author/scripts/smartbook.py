@@ -7,20 +7,26 @@ These checks are not a security review or a substitute for server validation.
 import argparse
 import json
 import os
-import posixpath
+import re
 from pathlib import Path, PurePosixPath
 import stat
 import sys
 import tempfile
 import unicodedata
 from html.parser import HTMLParser
-from urllib.parse import unquote, urlsplit
 from zipfile import BadZipFile, ZIP_DEFLATED, ZIP_STORED, ZipFile
 
 MAX_ARCHIVE = 50 * 1024 * 1024
-MAX_TOTAL = 200 * 1024 * 1024
+MAX_TOTAL = 16 * 1024 * 1024
 MAX_FILE = 32 * 1024 * 1024
 MAX_FILES = 1000
+MAX_HTML = 2 * 1024 * 1024
+MAX_OUTPUT = 24 * 1024 * 1024
+MAX_REFERENCES = 256
+MAX_NODES = 20000
+MAX_DEPTH = 128
+MAX_CSS_COMMENTS = 20000
+VOID_ELEMENTS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
 ARCHIVE_EXTENSIONS = {".zip", ".7z", ".rar", ".tar", ".gz", ".bz2", ".xz"}
 ALLOWED_EXTENSIONS = {
     ".html", ".htm", ".css", ".js", ".mjs", ".json", ".png", ".jpg",
@@ -57,18 +63,167 @@ def path_key(name):
     return unicodedata.normalize("NFC", name.rstrip("/")).casefold()
 
 
+MEDIA_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".ico",
+    ".mp3", ".mp4", ".ogg", ".ogv", ".webm", ".wav",
+    ".woff", ".woff2", ".ttf", ".otf",
+}
+
+
+def resource_path(reference):
+    value = reference.strip()
+    if (not value or re.search(r"[?#%\\\x00-\x1f]", value) or value.startswith("/")
+            or re.match(r"^[a-z][a-z0-9+.-]*:", value, re.I)):
+        return None
+    path = value[2:] if value.startswith("./") else value
+    if not path or any(part in ("", ".", "..") for part in path.split("/")):
+        return None
+    return path
+
+
+def css_error(value):
+    if "\\" in value:
+        return "CSS escapes/backslashes are unsupported"
+    parts, position, comments = [], 0, 0
+    while True:
+        start = value.find("/*", position)
+        if start < 0:
+            parts.append(value[position:])
+            break
+        end = value.find("*/", start + 2)
+        if end < 0:
+            return "CSS has an unterminated comment"
+        comments += 1
+        if comments > MAX_CSS_COMMENTS:
+            return "CSS exceeds the comment limit"
+        parts.append(value[position:start])
+        position = end + 2
+    value = "".join(parts)
+    if re.search(r"@import\b|\burl\s*\(", value, re.I):
+        return "CSS url() and @import are unsupported"
+    return None
+
+
 class References(HTMLParser):
-    def __init__(self):
+    def __init__(self, archive, files, errors, html_bytes):
         super().__init__(convert_charrefs=True)
-        self.references = []
+        self.archive, self.files, self.errors = archive, files, errors
+        self.style = None
+        self.output_budget = html_bytes
+        self.references = 0
+        self.nodes = 3
+        self.open_elements = []
+
+    def count_node(self):
+        self.nodes += 1
+        if self.nodes > MAX_NODES:
+            raise ValueError("reader HTML exceeds node limit")
+
+    def charge(self, name):
+        self.references += 1
+        self.output_budget += 4 * ((self.files[name].file_size + 2) // 3) + 128
+        if self.references > MAX_REFERENCES or self.output_budget > MAX_OUTPUT:
+            raise ValueError("reader resource count or rendered size exceeds limit")
+
+    def fail(self, message):
+        self.errors.append(f"index.html: {message}")
+
+    def file(self, ref, suffix):
+        name = resource_path(ref)
+        if not name or not name.lower().endswith(suffix):
+            self.fail(f"invalid {suffix} resource {ref!r}")
+            return None
+        if name not in self.files:
+            self.fail(f"missing resource {ref!r}")
+            return None
+        self.charge(name)
+        return self.archive.read(self.files[name])
+
+    def check_css(self, value):
+        error = css_error(value)
+        if error:
+            self.fail(error)
+
+    def handle_startendtag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self.fail(f"self-closing <{tag}> is unsupported")
+        super().handle_startendtag(tag, attrs)
 
     def handle_starttag(self, tag, attrs):
+        self.count_node()
+        if tag not in VOID_ELEMENTS:
+            self.open_elements.append(tag)
+            if len(self.open_elements) > MAX_DEPTH:
+                raise ValueError("reader HTML exceeds depth limit")
+        names = [name for name, _ in attrs]
+        if len(names) != len(set(names)):
+            self.fail(f"duplicate attribute on <{tag}>")
         attrs = dict(attrs)
-        for attr in ("src", "poster"):
-            if attrs.get(attr):
-                self.references.append((tag, attrs[attr]))
-        if tag == "link" and attrs.get("href"):
-            self.references.append((tag, attrs["href"]))
+        if tag in ("iframe", "frame", "object", "embed", "base", "form", "template"):
+            self.fail(f"unsupported element <{tag}>")
+        if tag == "meta" and "http-equiv" in attrs:
+            self.fail("meta http-equiv is unsupported")
+        if any(attr in attrs for attr in ("srcset", "formaction")):
+            self.fail("srcset and formaction are unsupported")
+        if attrs.get("style"):
+            self.check_css(attrs["style"])
+        if tag == "style":
+            self.style = []
+        if tag == "script":
+            script_type = (attrs.get("type") or "").strip().lower()
+            if script_type and script_type not in ("text/javascript", "application/javascript"):
+                self.fail("only classic JavaScript scripts are supported")
+            if "src" in attrs:
+                self.file(attrs["src"] or "", ".js")
+        elif tag == "link":
+            rel = (attrs.get("rel") or "").lower().split()
+            href = attrs.get("href")
+            if href is None:
+                self.fail("link requires href")
+            elif "stylesheet" in rel:
+                css = self.file(href, ".css")
+                if css is not None:
+                    try:
+                        self.check_css(css.decode("utf-8-sig"))
+                    except UnicodeDecodeError:
+                        self.fail(f"stylesheet {href!r} must be UTF-8")
+            elif "icon" not in rel or not href.startswith("data:image/"):
+                self.fail("link must be a local stylesheet or data:image icon")
+        else:
+            if "src" in attrs:
+                src = attrs["src"] or ""
+                if tag not in ("img", "audio", "video", "source", "track"):
+                    self.fail(f"unsupported src on <{tag}>")
+                elif not src.startswith("data:"):
+                    name = resource_path(src)
+                    if not name or PurePosixPath(name).suffix.lower() not in MEDIA_EXTENSIONS or name not in self.files:
+                        self.fail(f"missing or unsupported resource {src!r}")
+                    else:
+                        self.charge(name)
+            if "href" in attrs and not (attrs["href"] or "").startswith("#"):
+                self.fail("only same-document #anchor navigation is supported")
+            if "poster" in attrs:
+                self.fail("video poster is unsupported")
+
+    def handle_data(self, data):
+        if data:
+            self.count_node()
+        if self.style is not None:
+            self.style.append(data)
+
+    def handle_comment(self, data):
+        self.count_node()
+
+    def handle_decl(self, decl):
+        self.count_node()
+
+    def handle_endtag(self, tag):
+        if tag in self.open_elements:
+            last = len(self.open_elements) - 1 - self.open_elements[::-1].index(tag)
+            del self.open_elements[last:]
+        if tag == "style" and self.style is not None:
+            self.check_css("".join(self.style))
+            self.style = None
 
 
 def validate(archive):
@@ -83,7 +238,7 @@ def validate(archive):
             if len(entries) > MAX_FILES:
                 errors.append("archive contains more than 1000 entries")
             if sum(entry.file_size for entry in files) > MAX_TOTAL:
-                errors.append("expanded files exceed 200 MiB")
+                errors.append("expanded files exceed 16 MiB")
             seen = set()
             spellings = {}
             safe_files = {}
@@ -91,6 +246,8 @@ def validate(archive):
                 # filename is normalized by zipfile on Windows; inspect the original.
                 name = entry.orig_filename
                 reason = path_error(name)
+                if not entry.is_dir() and (resource_path(name) != name or name.strip() != name):
+                    reason = "reader requires an unambiguous relative archive path"
                 if reason:
                     errors.append(f"{name!r}: {reason}")
                     continue
@@ -155,32 +312,21 @@ def validate(archive):
                         errors.append(f"{name!r}: expanded size does not match ZIP directory")
             if not errors:
                 try:
+                    if safe_files["index.html"].file_size > MAX_HTML:
+                        raise ValueError("index.html exceeds 2 MiB")
                     html = zf.read("index.html").decode("utf-8-sig")
                 except UnicodeDecodeError:
                     errors.append("index.html must be UTF-8")
                 else:
-                    parser = References()
+                    parser = References(zf, safe_files, errors, safe_files["index.html"].file_size)
                     parser.feed(html)
-                    for tag, reference in parser.references:
-                        parsed = urlsplit(reference)
-                        if parsed.scheme in ("data", "blob") or reference.startswith("#"):
-                            continue
-                        if parsed.scheme or parsed.netloc or reference.startswith("//"):
-                            warnings.append(f"index.html: external {tag} resource {reference!r}")
-                            continue
-                        path = unquote(parsed.path)
-                        if not path:
-                            continue
-                        path = posixpath.normpath(path)
-                        reason = path_error(path)
-                        if reason:
-                            errors.append(f"index.html: invalid resource {reference!r}: {reason}")
-                        elif path not in safe_files:
-                            errors.append(f"index.html: missing resource {reference!r}")
+                    parser.close()
+                    if parser.style is not None:
+                        parser.check_css("".join(parser.style))
     except (OSError, BadZipFile, RuntimeError, ValueError, NotImplementedError) as exc:
         errors.append(f"cannot read archive: {exc}")
     return {"ok": not errors, "errors": errors, "warnings": warnings,
-            "scope": "preliminary ZIP structure and index.html resource checks only; not a security review"}
+            "scope": "ZIP structure and static index.html resource checks only; dynamic JavaScript is not inspected"}
 
 
 def pack(source, output):

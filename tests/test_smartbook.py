@@ -66,13 +66,77 @@ class SmartbookPackageTests(unittest.TestCase):
             with self.subTest(entries=entries):
                 self.assertFalse(smartbook.validate(self.archive(entries))["ok"])
 
-    def test_corrupt_archive_and_external_resource_warning(self):
+    def test_corrupt_archive_and_external_resource_rejected(self):
         broken = self.root / "broken.zip"
         broken.write_bytes(b"not a zip")
         self.assertFalse(smartbook.validate(broken)["ok"])
         report = smartbook.validate(self.archive([("index.html", '<script src="https://example.com/app.js"></script>')]))
-        self.assertTrue(report["ok"])
-        self.assertTrue(report["warnings"])
+        self.assertFalse(report["ok"])
+
+    def test_reader_rejects_unsupported_resources_and_accepts_local_ones(self):
+        cases = [
+            '<script type="module" src="app.js"></script>',
+            '<script type="module" TYPE="text/javascript" src="app.js"></script>',
+            '<a href="#safe" HREF="https://example.com">x</a>',
+            '<template><script src="app.js"></script></template>',
+            '<script src="app.js"/>',
+            '<style/>',
+            '<link rel="stylesheet" href="styles.css"><iframe src="https://example.com"></iframe>',
+            '<img src="https://example.com/a.png">',
+            '<a href="chapter2.html">next</a>',
+            '<img srcset="a.png 1x">',
+            '<video poster="a.png"></video>',
+            '<form><button formaction="/x">x</button></form>',
+            '<meta http-equiv="refresh" content="0;url=/">',
+            '<style>body { background: url(a.png) }</style>',
+            '<div style="background: url(a.png)">x</div>',
+            '<link rel="stylesheet" href="bad.css">',
+            '<script src="app.js?v=1"></script>',
+            '<script src="../app.js"></script>',
+        ]
+        for html in cases:
+            with self.subTest(html=html):
+                report = smartbook.validate(self.archive([
+                    ("index.html", html), ("app.js", "console.log(1)"),
+                    ("styles.css", "body { color: red }"), ("bad.css", "@import 'a.css';"),
+                    ("a.png", b"png"),
+                ]))
+                self.assertFalse(report["ok"], report)
+        report = smartbook.validate(self.archive([
+            ("index.html", '<link rel="stylesheet" href="./styles.css"><img src="a.png"><a href="#chapter">next</a><script src="app.js"></script>'),
+            ("styles.css", "body { color: red }"), ("app.js", "console.log(1)"), ("a.png", b"png"),
+        ]))
+        self.assertTrue(report["ok"], report)
+
+    def test_reader_rejects_ambiguous_archive_names_and_css_escape(self):
+        for name in ("a?b.js", "a#b.js", " whitespace.js"):
+            with self.subTest(name=name):
+                self.assertFalse(smartbook.validate(self.archive([("index.html", "ok"), (name, "ok")]))["ok"])
+        report = smartbook.validate(self.archive([
+            ("index.html", '<link rel="stylesheet" href="x.css">'), ("x.css", r"p { color: \72 ed }")
+        ]))
+        self.assertFalse(report["ok"], report)
+
+    def test_reader_resource_budgets_count_each_reference(self):
+        archive = self.archive([("index.html", '<img src="a.png"><img src="a.png">'), ("a.png", b"a" * 20)])
+        with patch.object(smartbook, "MAX_REFERENCES", 1):
+            self.assertFalse(smartbook.validate(archive)["ok"])
+        with patch.object(smartbook, "MAX_OUTPUT", 200):
+            self.assertFalse(smartbook.validate(archive)["ok"])
+        with patch.object(smartbook, "MAX_TOTAL", 30):
+            self.assertFalse(smartbook.validate(archive)["ok"])
+
+    def test_reader_html_complexity_and_css_comment_budgets(self):
+        archive = self.archive([("index.html", '<div><span>hello</span></div>')])
+        with patch.object(smartbook, "MAX_HTML", 5):
+            self.assertFalse(smartbook.validate(archive)["ok"])
+        with patch.object(smartbook, "MAX_NODES", 5):
+            self.assertFalse(smartbook.validate(archive)["ok"])
+        with patch.object(smartbook, "MAX_DEPTH", 1):
+            self.assertFalse(smartbook.validate(archive)["ok"])
+        with patch.object(smartbook, "MAX_CSS_COMMENTS", 2):
+            self.assertIsNotNone(smartbook.css_error('/*a*//*b*//*c*/ body{}'))
+            self.assertIsNone(smartbook.css_error('/*a*//*b*/ body{}'))
 
     def test_encrypted_entry_flag_is_rejected(self):
         archive = self.archive([("index.html", "ok")])

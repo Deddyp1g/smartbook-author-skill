@@ -34,7 +34,7 @@ WINDOWS_RESERVED = {"CON", "PRN", "AUX", "NUL"} | {
 
 
 def path_error(name):
-    if not name or len(name) > 1024 or "\\" in name or "%" in name or "\x00" in name or name.startswith("/"):
+    if not name or len(name.encode("utf-8")) > 1024 or "\\" in name or "%" in name or "\x00" in name or name.startswith("/"):
         return "path must be relative and use forward slashes"
     parts = name.rstrip("/").split("/")
     if any(part in ("", ".", "..") for part in parts):
@@ -44,8 +44,8 @@ def path_error(name):
     if any(ord(c) < 32 or ord(c) == 127 for c in name):
         return "path contains a control character"
     for part in parts:
-        if len(part) > 255:
-            return "path component exceeds 255 characters"
+        if len(part.encode("utf-8")) > 255:
+            return "path component exceeds 255 UTF-8 bytes"
         if part.rstrip(" .").split(".", 1)[0].upper() in WINDOWS_RESERVED:
             return "path contains a Windows reserved device name"
         if part.endswith((" ", ".")) or any(c in '<>:"|?*' for c in part):
@@ -121,6 +121,8 @@ def validate(archive):
                     continue
                 if entry.file_size > MAX_FILE:
                     errors.append(f"{name!r}: file exceeds 32 MiB")
+                if entry.file_size and (not entry.compress_size or entry.file_size > 200 * entry.compress_size):
+                    errors.append(f"{name!r}: compression ratio exceeds 200 or compressed size is zero")
                 if PurePosixPath(name).suffix.lower() in ARCHIVE_EXTENSIONS:
                     errors.append(f"{name!r}: nested archive is not allowed")
                 elif PurePosixPath(name).suffix.lower() not in ALLOWED_EXTENSIONS:

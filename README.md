@@ -54,6 +54,10 @@ python skills/smartbook-author/scripts/smartbook.py validate /path/to/smartbook.
 
 以上命令从本仓库根目录运行；如果安装在别处，请将脚本路径改为已安装技能中的路径。脚本只做有限的本地静态检查，不能证明网页安全、章节完整或一定通过平台上传；不要将它当成平台服务端校验或安全审查的替代品。平台的限制、审查结果和实际发布流程以部署版本为准。需有 Python 3.9 或更新版本；脚本无需安装额外依赖。
 
+如需在支持该协议的智慧书阅读器中保存主题和阅读位置，可使用随技能提供的可选存储客户端；接入方式和限制见 [存储说明](skills/smartbook-author/references/storage.md)。
+
+开发者可在仓库根目录运行 `python -m unittest discover -s tests -v` 和 `node --test tests/test_storage.cjs` 验证打包工具和存储客户端；后者需要 Node.js。
+
 ## 兼容性与许可
 
 上述安装目录来自各工具公开资料。已在隔离项目中用 Codex CLI `0.167.0-alpha.4.1` 验证项目技能发现：`skills/list` 返回该技能已启用且无加载错误，尚未用模型验证完整制作流程。Claude Code `2.1.201` 已检测到安装，但没有完成技能加载实测；DSH 和 CodeArts Snap 尚未在本机实测。本仓库尚未证明所有版本的工具都能自动加载，也未证明所有平台版本接受生成的包。请在目标版本中检查技能发现、显式调用和实际上传。DSH 官方项目处于开发预览阶段，接口可能变化。CodeArts Snap 的 `CODEARTS.md` 入口基于华为官方示例，尚无可核实的完整格式与版本规范。

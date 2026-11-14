@@ -98,6 +98,32 @@ class SmartbookPackageTests(unittest.TestCase):
                 result = smartbook.validate(archive)
                 self.assertEqual(result["ok"], method != ZIP_BZIP2, result)
 
+    def test_utf8_path_byte_limits(self):
+        name = "中" * 85 + ".js"
+        report = smartbook.validate(self.archive([("index.html", "ok"), (name, "ok")]))
+        self.assertFalse(report["ok"], report)
+        self.assertTrue(any("255 UTF-8 bytes" in err for err in report["errors"]))
+        path = "/".join(["中" * 70] * 5 + ["book.js"])
+        report = smartbook.validate(self.archive([("index.html", "ok"), (path, "ok")]))
+        self.assertFalse(report["ok"], report)
+        self.assertTrue(any("path must be relative" in err for err in report["errors"]))
+
+    def test_high_compression_ratio_and_zero_compressed_size(self):
+        archive = self.root / "ratio.zip"
+        with ZipFile(archive, "w", compression=ZIP_DEFLATED) as zf:
+            zf.writestr("index.html", "A" * 100_000)
+        report = smartbook.validate(archive)
+        self.assertFalse(report["ok"], report)
+        self.assertTrue(any("compression ratio" in err for err in report["errors"]))
+        archive = self.archive([("index.html", "nonempty")])
+        data = bytearray(archive.read_bytes())
+        central = data.index(b"PK\x01\x02")
+        data[central + 20:central + 24] = b"\x00\x00\x00\x00"
+        archive.write_bytes(data)
+        report = smartbook.validate(archive)
+        self.assertFalse(report["ok"], report)
+        self.assertTrue(any("compressed size is zero" in err for err in report["errors"]))
+
     def test_pack_output_and_limit_checks(self):
         source = self.root / "book"
         source.mkdir()

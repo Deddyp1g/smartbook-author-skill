@@ -66,7 +66,7 @@ python skills/smartbook-author/scripts/upload.py /path/to/smartbook.zip --book-i
 
 ## 临时云端验证
 
-本仓库对接独立的 [auto-deploy 参考项目](https://gitcode.com/weixin_43883336/auto-deploy)，提供智慧书打包、临时 ECS 部署、桌面和移动浏览器交互检查、销毁资源及上传同一 ZIP 的流程。安装依赖、环境变量、运行命令与中断恢复见 [云端验证说明](skills/smartbook-author/references/cloud-testing.md)。本集成已做本地和模拟验证，尚未在真实云账号中完成端到端测试；模拟结果不会解锁真实上传。
+本仓库对接独立的 [auto-deploy 参考项目](https://gitcode.com/weixin_43883336/auto-deploy)，提供智慧书打包、临时 ECS 部署、桌面和移动浏览器交互检查、销毁资源及上传同一 ZIP 的流程。首次云端部署时自动下载指定版本的 auto-deploy 并缓存，作者无需另行安装；Git、Terraform、浏览器及云凭证等仍需准备。环境变量、运行命令与中断恢复见 [云端验证说明](skills/smartbook-author/references/cloud-testing.md)。自动下载功能尚未测试，云端完整流程也尚未在真实云账号中验收；模拟结果不会解锁真实上传。
 
 参考项目未随本仓库分发；检查时其仓库未包含许可证，请在使用前自行确认适用条款。本项目 MIT 许可不覆盖该参考项目。平台实际阅读器的受限环境还需单独验证；平台审核仍由管理员进行。
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Adapter for a separately installed, pinned auto-deploy checkout.
+"""Adapter for a pinned, separately obtained auto-deploy checkout.
 
 The upstream repository is an external dependency and is not redistributed.
 Cloud creation and cleanup require Huawei Cloud credentials. Terraform state
@@ -12,10 +12,13 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
+import time
 import urllib.error
 import urllib.request
 
 REVISION = "971a801cf0917f2e86365d09b0ed58a93ca27262"
+UPSTREAM_URL = "https://gitcode.com/weixin_43883336/auto-deploy.git"
 ALLOWED = {
     ("huaweicloud_vpc", "app"), ("huaweicloud_vpc_subnet", "app"),
     ("huaweicloud_networking_secgroup", "app"),
@@ -47,16 +50,84 @@ def run_quiet(command, cwd=None, timeout=1800):
                           timeout=timeout, check=False)
 
 
-def upstream():
-    checkout = Path(os.environ["SMARTBOOK_AUTO_DEPLOY"]).expanduser().resolve(strict=True)
+class DependencyError(ValueError):
+    """A dependency could not be obtained or verified."""
+
+
+def validate_checkout(checkout):
     result = run_quiet(["git", "rev-parse", "HEAD"], checkout, 20)
     clean = run_quiet(["git", "status", "--porcelain", "--untracked-files=no"], checkout, 20)
     if result.returncode or result.stdout.decode().strip() != REVISION or clean.returncode or clean.stdout.strip():
-        raise ValueError("auto-deploy checkout is not the pinned clean revision")
+        raise DependencyError("auto-deploy checkout is not the required clean revision; inspect the configured path")
     for name in ("auto_deploy.py", "destroy.py"):
         if not (checkout / "scripts" / name).is_file():
-            raise ValueError("auto-deploy script missing")
+            raise DependencyError("auto-deploy checkout is incomplete; inspect the configured path")
     return checkout
+
+
+def git_bootstrap(command, cwd=None):
+    env = os.environ.copy()
+    env.pop("SMARTBOOK_API_KEY", None)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    try:
+        result = subprocess.run(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300, check=False)
+    except FileNotFoundError as exc:
+        raise DependencyError("Git is required to download auto-deploy; install Git and retry") from exc
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise DependencyError("could not download auto-deploy; check Git and network access and retry") from exc
+    if result.returncode:
+        raise DependencyError("could not download the pinned auto-deploy revision; check GitCode access and retry")
+
+
+def upstream():
+    override = os.environ.get("SMARTBOOK_AUTO_DEPLOY")
+    if override:
+        try:
+            return validate_checkout(Path(override).expanduser().resolve(strict=True))
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise DependencyError("cannot access SMARTBOOK_AUTO_DEPLOY; check its path and Git installation") from exc
+
+    cache = Path(os.environ.get("SMARTBOOK_CACHE_DIR", Path.home() / ".cache" / "smartbook-author"))
+    cache = cache.expanduser().resolve()
+    checkout = cache / ("auto-deploy-" + REVISION)
+    lock = cache / ("auto-deploy-" + REVISION + ".lock")
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+        if checkout.exists() or checkout.is_symlink():
+            return validate_checkout(checkout)
+
+        # A separate lock directory prevents simultaneous installations from
+        # replacing each other; existing cache entries are never overwritten.
+        deadline = time.monotonic() + 60
+        while True:
+            try:
+                lock.mkdir()
+                break
+            except FileExistsError:
+                if checkout.exists() or checkout.is_symlink():
+                    return validate_checkout(checkout)
+                if time.monotonic() >= deadline:
+                    raise DependencyError("auto-deploy installation is locked; wait or inspect the cache lock")
+                time.sleep(0.25)
+        try:
+            if checkout.exists() or checkout.is_symlink():
+                return validate_checkout(checkout)
+            with tempfile.TemporaryDirectory(prefix=".auto-deploy-download-", dir=cache) as temporary:
+                candidate = Path(temporary) / "checkout"
+                git_bootstrap(["git", "clone", "--no-checkout", "--", UPSTREAM_URL, str(candidate)])
+                git_bootstrap(["git", "checkout", "--detach", REVISION], cwd=candidate)
+                validate_checkout(candidate)
+                if checkout.exists() or checkout.is_symlink():
+                    return validate_checkout(checkout)
+                candidate.rename(checkout)
+            return checkout
+        finally:
+            lock.rmdir()
+    except DependencyError:
+        raise
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise DependencyError("cannot prepare auto-deploy cache; check Git and cache directory permissions") from exc
 
 
 def manifest(run_dir):
@@ -267,6 +338,9 @@ def main():
     try:
         run_dir = Path(sys.argv[2]).resolve(strict=True)
         result = globals()[sys.argv[1]](run_dir)
+    except DependencyError as exc:
+        result = {"ok": False, "ownership": "uncertain", "resource_ids": [], "error": "dependency_setup_failed",
+                  "message": str(exc)}
     except (OSError, ValueError, KeyError, json.JSONDecodeError, subprocess.SubprocessError):
         result = {"ok": False, "ownership": "uncertain", "resource_ids": [],
                   "error": "adapter_failed_inspect_retained_workdir"}

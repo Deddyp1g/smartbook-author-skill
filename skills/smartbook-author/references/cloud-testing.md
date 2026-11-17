@@ -1,12 +1,13 @@
 # Temporary Huawei Cloud preview and upload
 
-This workflow uses a separately installed [auto-deploy](https://gitcode.com/weixin_43883336/auto-deploy) checkout at revision `971a801cf0917f2e86365d09b0ed58a93ca27262`. That repository is not redistributed here and did not contain a license when inspected; check its terms before use. This integration has local and simulated tests, but has not been exercised against a real cloud account.
+This workflow uses [auto-deploy](https://gitcode.com/weixin_43883336/auto-deploy) at revision `971a801cf0917f2e86365d09b0ed58a93ca27262`. On first cloud deployment the skill downloads that revision into a local cache and reuses it on later runs. The upstream repository is not redistributed here and did not contain a license when inspected; check its terms before use. The automatic download and cloud workflow have not been tested against a real cloud account.
 
 ## Requirements
 
 - Python 3.10+, Git, Bash, SSH/SCP, Terraform 1.8+, Node.js and the Playwright Node package with a Chromium browser. On Windows use a shell environment supported by auto-deploy, such as Git Bash. Ensure the Bash executable actually works; the Windows WSL launcher alone is not a shell installation.
 - Huawei Cloud credentials as `HW_ACCESS_KEY` and `HW_SECRET_KEY` (or the upstream-supported `HUAWEICLOUD_ACCESS_KEY` and `HUAWEICLOUD_SECRET_KEY`), permissions and quota for ECS, EIP, VPC and related resources.
-- Set `SMARTBOOK_AUTO_DEPLOY` to the path of a clean checkout of the pinned auto-deploy revision, `SMARTBOOK_CLOUD_REGION` to the cloud region, and `SMARTBOOK_CLOUD_CIDR` to the public IPv4 address of the machine running the browser and SSH in `/32` notation.
+- Set `SMARTBOOK_CLOUD_REGION` to the cloud region and `SMARTBOOK_CLOUD_CIDR` to the public IPv4 address of the machine running the browser and SSH in `/32` notation. The first run also needs network access to GitCode and Git on PATH.
+- By default the pinned checkout is cached in `~/.cache/smartbook-author/auto-deploy-<revision>`. Set `SMARTBOOK_CACHE_DIR` to use a different cache root, or optionally set `SMARTBOOK_AUTO_DEPLOY` to a clean checkout of the pinned revision. The explicit checkout takes precedence and is not modified.
 - For upload, set `SMARTBOOK_API_KEY` locally to an author API key with edit access to the specified existing book. It is excluded from the deploy and browser subprocesses. The platform origin and book ID must be supplied by the author.
 
 Install the Playwright package where the Node.js process can resolve it from the installed skill's `scripts` directory. For example, from the installed skill directory run `npm install --no-save --no-package-lock playwright`, then `npx playwright install chromium`. Alternatively, install Playwright in an accessible Node module directory and set `NODE_PATH` to that directory; global npm packages are not automatically resolved on every platform. An existing Chromium-compatible executable can be selected with `--browser-executable`. Installing Playwright does not install Terraform or the other prerequisites.
@@ -14,7 +15,6 @@ Install the Playwright package where the Node.js process can resolve it from the
 Example environment setup in Bash (obtain credentials through your usual secure local method):
 
 ```bash
-export SMARTBOOK_AUTO_DEPLOY=/path/to/auto-deploy
 export SMARTBOOK_CLOUD_REGION=cn-north-4
 export SMARTBOOK_CLOUD_CIDR=203.0.113.10/32
 ```

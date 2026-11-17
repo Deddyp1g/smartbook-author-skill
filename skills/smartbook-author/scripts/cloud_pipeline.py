@@ -226,6 +226,8 @@ def staged_start(run_dir, adapter=None, timeout=1800, simulation=False):
             detail = result.get("error")
             if not isinstance(detail, str) or len(detail) > 256 or not detail.replace("_", "").isalnum():
                 detail = "ownership_uncertain"
+            if detail == "dependency_setup_failed" and isinstance(result.get("message"), str):
+                detail = result["message"][:300]
             state.update(status="deployment_uncertain", reason=detail, deployment_error=detail)
         else:
             state.update(status="awaiting_verification", resource_ids=ids, endpoint=result.get("endpoint"))

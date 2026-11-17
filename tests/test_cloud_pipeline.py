@@ -32,6 +32,7 @@ if "SMARTBOOK_API_KEY" in os.environ:
 scenario = os.environ.get("PIPELINE_TEST_SCENARIO", "success")
 records = {
     "deploy": {"ok": scenario != "deploy_fail", "ownership": "uncertain" if scenario == "foreign" else "owned", "resource_ids": ["test-ecs-1"], "endpoint": "http://127.0.0.1:1"},
+    "recover": {"ok": scenario != "foreign", "ownership": "uncertain" if scenario == "foreign" else "owned", "resource_ids": ["test-ecs-1"]},
     "verify": {"ok": scenario != "verify_fail", "sha256": os.environ["PIPELINE_TEST_SHA256"], "checks": {"http": True, "desktop": True, "mobile": True, "interaction": True, "console": True}},
     "cleanup": {"ok": scenario != "cleanup_fail", "destroyed_ids": [] if scenario == "missing_destroy" else ["test-ecs-1"]},
     "confirm": {"ok": scenario != "confirm_fail", "absent_ids": [] if scenario == "missing_absent" else ["test-ecs-1"], "independently_verified": scenario != "confirm_unverified"},
@@ -202,7 +203,7 @@ class CloudPipelineTests(unittest.TestCase):
         state.update(status="upload_ready", simulation=False, resource_ids=["unit-test"],
                      verification={"ok": True, "sha256": sha, "checks": dict.fromkeys(pipeline.CHECKS, True)},
                      cleanup={"destroyed_ids": ["unit-test"], "absent_ids": ["unit-test"],
-                              "independently_verified": True})
+                              "independently_verified": False, "verification": "terraform_state_empty"})
         state_path.write_text(json.dumps(state), encoding="utf-8")
         with patch.object(pipeline, "upload", return_value={"ok": False, "error": "upload_outcome_unknown"}) as send:
             first = pipeline.upload_ready(self.run_dir, 7, "http://127.0.0.1:1")
@@ -221,7 +222,7 @@ class CloudPipelineTests(unittest.TestCase):
 
     def start_staged(self, scenario="success"):
         self.environment["PIPELINE_TEST_SCENARIO"] = scenario
-        return self.staged("staged-start", "--adapter", self.adapter)
+        return self.staged("staged-start", "--adapter", self.adapter, "--simulation")
 
     def test_staged_run_pauses_for_verification_then_cleans(self):
         self.prepare()
@@ -269,11 +270,45 @@ class CloudPipelineTests(unittest.TestCase):
         self.assertEqual(self.observed_phases(), ["deploy", "cleanup", "confirm"])
         self.assert_upload_blocked()
 
+    def test_staged_cleanup_recovers_interrupted_deploy(self):
+        self.prepare()
+        self.assertEqual(self.start_staged().returncode, 0)
+        state_path = self.run_dir / "pipeline.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["status"] = "deploying"
+        state.pop("resource_ids")
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        self.assertEqual(self.staged("staged-cleanup").returncode, 0)
+        self.assertEqual(self.observed_phases(), ["deploy", "recover", "cleanup", "confirm"])
+        self.assert_upload_blocked()
+
+    def test_staged_cleanup_recovers_after_deployment_timeout(self):
+        self.prepare()
+        with patch.object(pipeline, "call_adapter", side_effect=subprocess.TimeoutExpired("deploy", 1)):
+            result = pipeline.staged_start(self.run_dir, self.adapter, simulation=True)
+        self.assertEqual(result["status"], "deployment_uncertain")
+        self.assertIn("timed out", result["reason"])
+        self.assertEqual(self.staged("staged-cleanup").returncode, 0)
+        state = json.loads((self.run_dir / "pipeline.json").read_text(encoding="utf-8"))
+        self.assertIn("timed out", state["deployment_error"])
+        self.assertEqual(self.observed_phases(), ["recover", "cleanup", "confirm"])
+        self.assert_upload_blocked()
+
+    def test_staged_cleanup_retries_recovery_after_uncertain_deployment(self):
+        self.prepare()
+        self.assertNotEqual(self.start_staged("foreign").returncode, 0)
+        self.assertNotEqual(self.staged("staged-cleanup").returncode, 0)
+        self.assertEqual(self.observed_phases(), ["deploy", "recover"])
+        self.environment["PIPELINE_TEST_SCENARIO"] = "success"
+        self.assertEqual(self.staged("staged-cleanup").returncode, 0)
+        self.assertEqual(self.observed_phases(), ["deploy", "recover", "recover", "cleanup", "confirm"])
+        self.assert_upload_blocked()
+
     def test_staged_cleanup_refuses_unconfirmed_ownership(self):
         self.prepare()
         self.assertNotEqual(self.start_staged("foreign").returncode, 0)
         self.assertNotEqual(self.staged("staged-cleanup").returncode, 0)
-        self.assertEqual(self.observed_phases(), ["deploy"])
+        self.assertEqual(self.observed_phases(), ["deploy", "recover"])
         self.assert_upload_blocked()
 
     def test_staged_commands_refuse_adapter_modified_since_deploy(self):
@@ -284,6 +319,32 @@ class CloudPipelineTests(unittest.TestCase):
         self.assertNotEqual(self.staged("staged-cleanup").returncode, 0)
         self.assertEqual(self.observed_phases(), ["deploy"])
         self.assert_upload_blocked()
+
+    def test_real_staged_workflow_accepts_terraform_cleanup_without_claiming_independent_verification(self):
+        self.prepare()
+        sha = self.environment["PIPELINE_TEST_SHA256"]
+        phases = []
+
+        def fake_call(adapter, phase, root, timeout):
+            phases.append(phase)
+            if phase == "deploy":
+                return {"ok": True, "ownership": "owned", "resource_ids": ["unit-test"], "endpoint": "http://127.0.0.1:8080"}
+            if phase == "verify":
+                return {"ok": True, "sha256": sha, "checks": dict.fromkeys(pipeline.CHECKS, True)}
+            if phase == "cleanup":
+                return {"ok": True, "destroyed_ids": ["unit-test"]}
+            return {"ok": True, "absent_ids": ["unit-test"], "verification": "terraform_state_empty", "independently_verified": False}
+
+        with patch.object(pipeline, "call_adapter", side_effect=fake_call):
+            start = pipeline.staged_start(self.run_dir)
+            self.assertEqual(start["status"], "awaiting_verification")
+            self.assertEqual(phases, ["deploy"])
+            self.assertTrue(pipeline.staged_verify(self.run_dir)["ok"])
+            result = pipeline.staged_cleanup(self.run_dir)
+        self.assertEqual(result["status"], "upload_ready")
+        self.assertFalse(result["cleanup"]["independently_verified"])
+        self.assertEqual(result["cleanup"]["verification"], "terraform_state_empty")
+        self.assertEqual(phases, ["deploy", "verify", "cleanup", "confirm"])
 
 
 if __name__ == "__main__":

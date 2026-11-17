@@ -2,7 +2,8 @@
 """Adapter for a separately installed, pinned auto-deploy checkout.
 
 The upstream repository is an external dependency and is not redistributed.
-Cloud creation, cleanup, and independent deletion checks need real credentials.
+Cloud creation and cleanup require Huawei Cloud credentials. Terraform state
+does not constitute an independent provider-side deletion check.
 """
 import ipaddress
 import json
@@ -66,7 +67,7 @@ def manifest(run_dir):
     return value
 
 
-def state_inventory(run_dir):
+def state_inventory(run_dir, expected_ids=None):
     """Refuse state whose resources cannot be attributed to this unique run."""
     name = manifest(run_dir)["app_name"]
     work = run_dir / "auto-deploy"
@@ -74,15 +75,20 @@ def state_inventory(run_dir):
         raise ValueError("upstream recovery/import detected; ownership uncertain")
     state = read_json(work / "terraform" / "terraform.tfstate")
     found = {}
-    for resource in state.get("resources", []):
+    resources = state.get("resources")
+    if not isinstance(resources, list):
+        raise ValueError("invalid state inventory")
+    for resource in resources:
         if resource.get("mode") != "managed":
             continue
         key = (resource.get("type"), resource.get("name"))
         if resource.get("module") or key not in ALLOWED or key in found:
             raise ValueError("unexpected managed resource")
         instances = resource.get("instances")
-        if not isinstance(instances, list) or len(instances) != 1:
+        if not isinstance(instances, list) or len(instances) > 1:
             raise ValueError("unexpected resource instances")
+        if not instances:
+            continue
         if instances[0].get("deposed") or instances[0].get("status") == "tainted":
             raise ValueError("resource state is ambiguous")
         attrs = instances[0].get("attributes") or {}
@@ -90,8 +96,18 @@ def state_inventory(run_dir):
         if not isinstance(resource_id, str) or not resource_id:
             raise ValueError("resource id missing")
         found[key] = attrs
-    if not found:
+    if not found and expected_ids is None:
         raise ValueError("no state-managed resources")
+
+    # During a retry, resources already removed from state are known from the
+    # inventory captured before the first destroy attempt.
+    previous = {}
+    if expected_ids is not None:
+        for entry in expected_ids:
+            address, separator, resource_id = entry.partition(":")
+            if not separator or not resource_id:
+                raise ValueError("invalid original resource inventory")
+            previous[address] = resource_id
 
     named = {
         ("huaweicloud_vpc", "app"): ("name", "auto-deploy-vpc-" + name),
@@ -110,32 +126,82 @@ def state_inventory(run_dir):
             bandwidth = bandwidth[0]
         if not isinstance(bandwidth, dict) or bandwidth.get("name") != "auto-deploy-bandwidth-" + name:
             raise ValueError("EIP ownership is unclear")
-    sg = found.get(("huaweicloud_networking_secgroup", "app"), {}).get("id")
+    sg = (found.get(("huaweicloud_networking_secgroup", "app"), {}).get("id")
+          or previous.get("huaweicloud_networking_secgroup.app"))
     for (rtype, _), attrs in found.items():
         if rtype == "huaweicloud_networking_secgroup_rule" and (not sg or attrs.get("security_group_id") != sg):
             raise ValueError("security group rule ownership is unclear")
     subnet = found.get(("huaweicloud_vpc_subnet", "app"))
-    vpc = found.get(("huaweicloud_vpc", "app"), {}).get("id")
+    vpc = found.get(("huaweicloud_vpc", "app"), {}).get("id") or previous.get("huaweicloud_vpc.app")
     if subnet and (not vpc or subnet.get("vpc_id") != vpc):
         raise ValueError("subnet ownership is unclear")
     assoc = found.get(("huaweicloud_compute_eip_associate", "app"))
-    instance = found.get(("huaweicloud_compute_instance", "app"), {}).get("id")
-    if assoc and (not instance or assoc.get("instance_id") != instance or not eip):
+    instance = (found.get(("huaweicloud_compute_instance", "app"), {}).get("id")
+                or previous.get("huaweicloud_compute_instance.app"))
+    if assoc and (not instance or assoc.get("instance_id") != instance
+                  or (not eip and not previous.get("huaweicloud_vpc_eip.app"))):
         raise ValueError("EIP association ownership is unclear")
     return sorted(f"{rtype}.{item}:{attrs['id']}" for (rtype, item), attrs in found.items())
 
 
 def deploy(run_dir):
-    # This release has no authenticated provider-side deletion verifier.
-    # Refuse billable creation until the whole lifecycle is implemented and tested.
-    return {"ok": False, "ownership": "uncertain", "resource_ids": [],
-            "error": "real_cloud_creation_disabled_missing_deletion_verifier"}
+    checkout = upstream()
+    data = manifest(run_dir)
+    work = run_dir / "auto-deploy"
+    if work.exists():
+        raise ValueError("refusing to reuse deployment directory")
+    region = os.environ["SMARTBOOK_CLOUD_REGION"]
+    if not re.fullmatch(r"[a-z0-9-]{3,40}", region):
+        raise ValueError("invalid cloud region")
+    cidr = ipaddress.ip_network(os.environ["SMARTBOOK_CLOUD_CIDR"], strict=True)
+    if cidr.version != 4 or cidr.prefixlen != 32:
+        raise ValueError("control address must be an IPv4 /32")
+    command = [sys.executable, str(checkout / "scripts" / "auto_deploy.py"),
+               "--repo", str(run_dir / "staging"), "--app-name", data["app_name"],
+               "--region", region, "--workdir", str(work), "--network-mode", "create",
+               "--ssh-cidr", str(cidr), "--public-cidr", str(cidr), "--app-port", "5000",
+               "--no-http", "--no-https", "--yes"]
+    try:
+        result = run_quiet(command, checkout)
+    except (OSError, subprocess.TimeoutExpired):
+        return {"ok": False, "ownership": "uncertain", "resource_ids": [],
+                "error": "deployment_interrupted_inspect_retained_workdir",
+                "diagnostic_directory": str(work)}
+    try:
+        ids = state_inventory(run_dir)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {"ok": False, "ownership": "uncertain", "resource_ids": [],
+                "error": "ownership_unconfirmed_inspect_retained_workdir",
+                "diagnostic_directory": str(work)}
+    if result.returncode:
+        return {"ok": False, "ownership": "owned", "resource_ids": ids,
+                "error": "deployment_failed_cleanup_required", "diagnostic_directory": str(work)}
+    try:
+        info = read_json(work / "resource-info.json")
+        host = str(ipaddress.IPv4Address(info["public_ip"]))
+    except (OSError, KeyError, ValueError):
+        return {"ok": False, "ownership": "owned", "resource_ids": ids,
+                "error": "endpoint_missing_cleanup_required", "diagnostic_directory": str(work)}
+    return {"ok": True, "ownership": "owned", "resource_ids": ids,
+            "endpoint": f"http://{host}:5000/"}
+
+
+def recover(run_dir):
+    if os.environ.get("SMARTBOOK_RECOVERY_PROCESSES_STOPPED") != "yes":
+        return {"ok": False, "ownership": "uncertain", "resource_ids": [],
+                "error": "confirm_deploy_processes_stopped_before_recovery"}
+    try:
+        ids = state_inventory(run_dir)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {"ok": False, "ownership": "uncertain", "resource_ids": [],
+                "error": "ownership_unconfirmed_inspect_retained_workdir"}
+    return {"ok": True, "ownership": "owned", "resource_ids": ids}
 
 def verify(run_dir):
     data = manifest(run_dir)
     info = read_json(run_dir / "auto-deploy" / "resource-info.json")
     host = str(ipaddress.ip_address(info["public_ip"]))
-    endpoint = f"http://{host}:8080/"
+    endpoint = f"http://{host}:5000/"
     try:
         with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(endpoint, timeout=20) as response:
             observed = response.read(2 * 1024 * 1024 + 1)
@@ -144,8 +210,8 @@ def verify(run_dir):
     except (OSError, urllib.error.URLError):
         http_ok = False
     # A separate browser run must describe actual page interactions and console status.
-    browser_path = os.environ.get("SMARTBOOK_BROWSER_REPORT")
-    browser = read_json(Path(browser_path)) if browser_path else {}
+    browser_path = Path(os.environ.get("SMARTBOOK_BROWSER_REPORT", str(run_dir / "browser-report.json")))
+    browser = read_json(browser_path) if browser_path.exists() else {}
     checks = browser.get("checks", {}) if isinstance(browser.get("checks"), dict) else {}
     bound = browser.get("sha256") == data.get("sha256") and browser.get("endpoint") == endpoint
     output_checks = {key: bound and checks.get(key) is True for key in ("desktop", "mobile", "interaction", "console")}
@@ -155,26 +221,47 @@ def verify(run_dir):
 
 def cleanup(run_dir):
     checkout = upstream()
-    ids = state_inventory(run_dir)
     expected = read_json(run_dir / "pipeline.json").get("resource_ids")
-    if not isinstance(expected, list) or sorted(expected) != ids:
+    if (not isinstance(expected, list) or not expected
+            or not all(isinstance(value, str) and value for value in expected)
+            or len(set(expected)) != len(expected)):
+        raise ValueError("original resource inventory is invalid")
+    ids = state_inventory(run_dir, expected_ids=expected)
+    if not set(ids).issubset(expected):
         raise ValueError("state inventory changed since deployment; refusing destroy")
+    if not ids:
+        return {"ok": True, "destroyed_ids": expected}
     result = run_quiet([sys.executable, str(checkout / "scripts" / "destroy.py"),
                         "--workdir", str(run_dir / "auto-deploy" / "terraform"), "--auto-approve"], checkout)
     if result.returncode:
-        return {"ok": False, "destroyed_ids": [], "error": "destroy_failed_inspect_retained_workdir"}
-    return {"ok": True, "destroyed_ids": ids}
+        return {"ok": False, "destroyed_ids": [], "error": "destroy_failed_inspect_retained_workdir",
+                "diagnostic_directory": str(run_dir / "auto-deploy")}
+    return {"ok": True, "destroyed_ids": expected}
 
 
 def confirm(run_dir):
-    # A user-written report and an empty Terraform state do not independently
-    # establish that the provider deleted every billable resource.
-    return {"ok": False, "absent_ids": [], "independently_verified": False,
-            "error": "provider_api_deletion_verifier_not_available"}
+    # Terraform state is useful cleanup evidence, not independent cloud verification.
+    failed = {"ok": False, "absent_ids": [], "independently_verified": False,
+              "error": "terraform_state_not_empty_or_unavailable"}
+    try:
+        state = read_json(run_dir / "auto-deploy" / "terraform" / "terraform.tfstate")
+        resources = state["resources"]
+        destroyed = read_json(run_dir / "pipeline.json")["destroyed_ids"]
+        if not isinstance(resources, list) or not isinstance(destroyed, list) or not destroyed:
+            return failed
+        for resource in resources:
+            if not isinstance(resource, dict) or not isinstance(resource.get("instances"), list):
+                return failed
+            if resource.get("mode") == "managed" and resource["instances"]:
+                return failed
+    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+        return failed
+    return {"ok": True, "absent_ids": destroyed, "verification": "terraform_state_empty",
+            "independently_verified": False}
 
 
 def main():
-    if len(sys.argv) != 3 or sys.argv[1] not in ("deploy", "verify", "cleanup", "confirm"):
+    if len(sys.argv) != 3 or sys.argv[1] not in ("deploy", "recover", "verify", "cleanup", "confirm"):
         print(json.dumps({"ok": False, "error": "expected phase and run directory"}))
         return 1
     try:

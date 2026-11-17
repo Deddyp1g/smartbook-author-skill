@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,8 @@ from upload import checked_snapshot, upload
 HERE = Path(__file__).resolve().parent
 REAL_ADAPTER = HERE / "huawei_cloud_adapter.py"
 CHECKS = ("http", "desktop", "mobile", "interaction", "console")
+# These path components are omitted by the pinned auto-deploy rsync/tar upload.
+DEPLOY_EXCLUDED_COMPONENTS = frozenset({".git", ".auto-deploy", "node_modules", ".venv", "venv", "target", "build", "dist", ".env"})
 PREVIEW_APP = (
     "from flask import Flask, send_from_directory\n"
     "app = Flask(__name__, static_folder=None)\n"
@@ -51,6 +54,10 @@ def load_json(path):
 
 def prepare(archive, run_dir):
     data = checked_snapshot(archive)
+    with ZipFile(io.BytesIO(data)) as zipped:
+        for entry in zipped.infolist():
+            if any(part in DEPLOY_EXCLUDED_COMPONENTS for part in entry.filename.split("/")):
+                raise ValueError("auto-deploy excludes this archive path: " + entry.filename + "; rename it and update its references")
     root = Path(run_dir).resolve()
     root.mkdir(mode=0o700, parents=True, exist_ok=False)
     stage = root / "staging"
@@ -191,8 +198,8 @@ def execute(run_dir, adapter=None, simulation=False, timeout=1800):
             "reason": state.get("reason")}
 
 
-def staged_start(run_dir, adapter, timeout=1800):
-    """Simulation-only pause point for an agent to inspect a deployed preview."""
+def staged_start(run_dir, adapter=None, timeout=1800, simulation=False):
+    """Deploy and pause so the preview can be exercised before cleanup."""
     root = Path(run_dir).resolve(strict=True)
     manifest = load_json(root / "manifest.json")
     state = load_json(root / "pipeline.json")
@@ -201,30 +208,45 @@ def staged_start(run_dir, adapter, timeout=1800):
     if digest(checked_snapshot(root / "snapshot.zip")) != manifest["sha256"]:
         raise ValueError("snapshot changed after preparation")
     check_staging(root)
-    adapter_path = Path(adapter).resolve(strict=True)
-    state.update(status="deploying", simulation=True, adapter=str(adapter_path),
+    if simulation:
+        if not adapter:
+            raise ValueError("simulation requires an adapter")
+        adapter_path = Path(adapter).resolve(strict=True)
+    else:
+        if adapter is not None and Path(adapter).resolve() != REAL_ADAPTER.resolve():
+            raise ValueError("real runs require the bundled Huawei adapter")
+        adapter_path = REAL_ADAPTER.resolve(strict=True)
+    state.update(status="deploying", simulation=simulation, adapter=str(adapter_path),
                  adapter_sha256=digest(adapter_path.read_bytes()))
     write_json(root / "pipeline.json", state)
     try:
         result = call_adapter(adapter_path, "deploy", root, timeout)
         ids = result.get("resource_ids")
         if result.get("ownership") != "owned" or not valid_ids(ids):
-            state.update(status="blocked", reason="ownership uncertain; inspect run directory")
+            detail = result.get("error")
+            if not isinstance(detail, str) or len(detail) > 256 or not detail.replace("_", "").isalnum():
+                detail = "ownership_uncertain"
+            state.update(status="deployment_uncertain", reason=detail, deployment_error=detail)
         else:
             state.update(status="awaiting_verification", resource_ids=ids, endpoint=result.get("endpoint"))
             if result.get("ok") is not True:
-                state.update(status="verification_failed", reason="deployment failed; run staged-cleanup")
+                detail = result.get("error")
+                if not isinstance(detail, str) or len(detail) > 256 or not detail.replace("_", "").isalnum():
+                    detail = "deployment_failed"
+                state.update(status="verification_failed", reason=detail, deployment_error=detail)
     except (ValueError, OSError, subprocess.SubprocessError) as exc:
-        state.update(status="blocked", reason=str(exc))
+        state.update(status="deployment_uncertain", reason=str(exc), deployment_error=str(exc))
     write_json(root / "pipeline.json", state)
     return {"ok": state["status"] == "awaiting_verification", "status": state["status"],
             "endpoint": state.get("endpoint"), "sha256": state["sha256"], "reason": state.get("reason")}
 
 
 def staged_adapter(state):
-    if state.get("simulation") is not True:
-        raise ValueError("staged commands support simulation only")
+    if state.get("simulation") not in (True, False):
+        raise ValueError("invalid simulation status")
     adapter = Path(state.get("adapter", "")).resolve(strict=True)
+    if state.get("simulation") is False and adapter != REAL_ADAPTER.resolve(strict=True):
+        raise ValueError("real runs require the bundled Huawei adapter")
     if digest(adapter.read_bytes()) != state.get("adapter_sha256"):
         raise ValueError("adapter changed; refuse to continue")
     return adapter
@@ -258,12 +280,20 @@ def staged_verify(run_dir, timeout=1800):
 def staged_cleanup(run_dir, timeout=1800):
     root = Path(run_dir).resolve(strict=True)
     state = load_json(root / "pipeline.json")
-    if state.get("status") not in ("awaiting_verification", "verifying", "verified", "verification_failed", "cleaning", "cleanup_failed", "confirming", "confirmation_failed"):
+    if state.get("status") not in ("deploying", "deployment_uncertain", "awaiting_verification", "verifying", "verified", "verification_failed", "cleaning", "cleanup_failed", "confirming", "confirmation_failed"):
         raise ValueError("run has no safely recoverable owned resources")
+    adapter = staged_adapter(state)
     ids = state.get("resource_ids")
+    if state.get("status") in ("deploying", "deployment_uncertain"):
+        result = call_adapter(adapter, "recover", root, timeout)
+        ids = result.get("resource_ids")
+        if result.get("ok") is not True or result.get("ownership") != "owned" or not valid_ids(ids):
+            raise ValueError("resource ownership is not established; inspect the run directory")
+        state.update(status="verification_failed", resource_ids=ids,
+                     reason="deployment interrupted; cleanup recovered resources")
+        write_json(root / "pipeline.json", state)
     if not valid_ids(ids):
         raise ValueError("resource ownership is not established; inspect the run directory")
-    adapter = staged_adapter(state)
     try:
         if state.get("status") in ("confirming", "confirmation_failed"):
             deleted = state.get("destroyed_ids")
@@ -280,17 +310,23 @@ def staged_cleanup(run_dir, timeout=1800):
             write_json(root / "pipeline.json", state)
         result = call_adapter(adapter, "confirm", root, timeout)
         absent = result.get("absent_ids")
-        if not (result.get("ok") is True and result.get("independently_verified") is True
+        valid_confirmation = (result.get("independently_verified") is True if state["simulation"] else
+                              result.get("verification") == "terraform_state_empty")
+        if not (result.get("ok") is True and valid_confirmation
                 and valid_ids(absent) and set(absent) == set(ids)):
-            raise ValueError("independent cloud deletion verification was not completed")
-        state["cleanup"] = {"destroyed_ids": deleted, "absent_ids": absent, "independently_verified": True}
-        state["status"] = "simulation_passed" if state.get("verification", {}).get("ok") is True else "simulation_cleaned"
+            raise ValueError("cleanup confirmation was not completed")
+        state["cleanup"] = {"destroyed_ids": deleted, "absent_ids": absent,
+                            "independently_verified": result.get("independently_verified") is True,
+                            "verification": result.get("verification", "independent")}
+        verified = state.get("verification", {}).get("ok") is True
+        state["status"] = ("simulation_passed" if verified else "simulation_cleaned") if state["simulation"] else (
+            "upload_ready" if verified else "cleaned")
         state.pop("reason", None)
     except (ValueError, OSError, subprocess.SubprocessError) as exc:
         state.update(status="confirmation_failed" if state.get("status") == "confirming" else "cleanup_failed", reason=str(exc))
     write_json(root / "pipeline.json", state)
-    return {"ok": state["status"] in ("simulation_passed", "simulation_cleaned"),
-            "status": state["status"], "reason": state.get("reason")}
+    return {"ok": state["status"] in ("simulation_passed", "simulation_cleaned", "upload_ready", "cleaned"),
+            "status": state["status"], "reason": state.get("reason"), "cleanup": state.get("cleanup")}
 
 
 def upload_ready(run_dir, book_id, base_url, idempotency_key=None):
@@ -298,7 +334,7 @@ def upload_ready(run_dir, book_id, base_url, idempotency_key=None):
     manifest = load_json(root / "manifest.json")
     state = load_json(root / "pipeline.json")
     if state.get("status") != "upload_ready" or state.get("simulation") is not False:
-        raise ValueError("upload blocked: real verification and independent cleanup are required")
+        raise ValueError("upload blocked: real verification and cleanup are required")
     data = checked_snapshot(root / "snapshot.zip")
     sha = digest(data)
     report = state.get("verification", {})
@@ -308,7 +344,7 @@ def upload_ready(run_dir, book_id, base_url, idempotency_key=None):
     if (sha != manifest.get("sha256") or sha != state.get("sha256")
             or report.get("sha256") != sha or report.get("ok") is not True
             or not all(checks.get(key) is True for key in CHECKS)
-            or clean.get("independently_verified") is not True or not valid_ids(ids)
+            or clean.get("verification") != "terraform_state_empty" or not valid_ids(ids)
             or set(clean.get("destroyed_ids", [])) != set(ids) or set(clean.get("absent_ids", [])) != set(ids)):
         raise ValueError("upload blocked: snapshot or verification evidence does not match")
     previous_key = state.get("upload_idempotency_key")
@@ -345,12 +381,13 @@ def main():
     run.add_argument("--adapter")
     run.add_argument("--simulation", action="store_true")
     run.add_argument("--timeout", type=int, default=1800)
-    start = sub.add_parser("staged-start", help="simulation only: pause after deployment")
+    start = sub.add_parser("staged-start", help="deploy and pause for browser verification")
     start.add_argument("--run-dir", required=True)
-    start.add_argument("--adapter", required=True)
+    start.add_argument("--adapter", help="custom adapter for simulation only")
+    start.add_argument("--simulation", action="store_true")
     start.add_argument("--timeout", type=int, default=1800)
     for name in ("staged-verify", "staged-cleanup"):
-        stage = sub.add_parser(name, help="simulation only: verify or recover cleanup")
+        stage = sub.add_parser(name, help="verify or recover cleanup")
         stage.add_argument("--run-dir", required=True)
         stage.add_argument("--timeout", type=int, default=1800)
     send = sub.add_parser("upload")
@@ -365,7 +402,7 @@ def main():
         elif args.command == "execute":
             result = execute(args.run_dir, args.adapter, args.simulation, args.timeout)
         elif args.command == "staged-start":
-            result = staged_start(args.run_dir, args.adapter, args.timeout)
+            result = staged_start(args.run_dir, args.adapter, args.timeout, args.simulation)
         elif args.command == "staged-verify":
             result = staged_verify(args.run_dir, args.timeout)
         elif args.command == "staged-cleanup":

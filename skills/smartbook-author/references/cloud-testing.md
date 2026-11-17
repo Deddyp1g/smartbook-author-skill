@@ -1,28 +1,55 @@
-# Temporary Huawei Cloud preview — experimental
+# Temporary Huawei Cloud preview and upload
 
-This repository contains a **simulation and integration prototype**, not an operational cloud-test-and-upload workflow. The real Huawei adapter is disabled until independently verified resource ownership, browser verification, cleanup, cloud-side deletion verification, and recovery are implemented and tested together. Do not attempt to enable it by editing its state or substituting the direct uploader to bypass the gate.
+This workflow uses a separately installed [auto-deploy](https://gitcode.com/weixin_43883336/auto-deploy) checkout at revision `971a801cf0917f2e86365d09b0ed58a93ca27262`. That repository is not redistributed here and did not contain a license when inspected; check its terms before use. This integration has local and simulated tests, but has not been exercised against a real cloud account.
 
-The external [auto-deploy repository](https://gitcode.com/weixin_43883336/auto-deploy) is not bundled. The inspected revision is `971a801cf0917f2e86365d09b0ed58a93ca27262`; its repository did not include a license when inspected. Review its terms independently before use. Its Terraform state may include an imported pre-existing keypair and its destroy operation affects all state-managed resources. An empty Terraform state is not independent proof that billable cloud resources are gone. Do not use this prototype to create resources.
+## Requirements
 
-## Intended workflow
+- Python 3.10+, Git, Bash, SSH/SCP, Terraform 1.8+, Node.js and the Playwright Node package with a Chromium browser. On Windows use a shell environment supported by auto-deploy, such as Git Bash. Ensure the Bash executable actually works; the Windows WSL launcher alone is not a shell installation.
+- Huawei Cloud credentials as `HW_ACCESS_KEY` and `HW_SECRET_KEY` (or the upstream-supported `HUAWEICLOUD_ACCESS_KEY` and `HUAWEICLOUD_SECRET_KEY`), permissions and quota for ECS, EIP, VPC and related resources.
+- Set `SMARTBOOK_AUTO_DEPLOY` to the path of a clean checkout of the pinned auto-deploy revision, `SMARTBOOK_CLOUD_REGION` to the cloud region, and `SMARTBOOK_CLOUD_CIDR` to the public IPv4 address of the machine running the browser and SSH in `/32` notation.
+- For upload, set `SMARTBOOK_API_KEY` locally to an author API key with edit access to the specified existing book. It is excluded from the deploy and browser subprocesses. The platform origin and book ID must be supplied by the author.
 
-1. Build and validate the complete book using the package guide. The author supplies the source and has rights to its content.
-2. Preserve the exact ZIP snapshot and extract only that snapshot into the temporary preview staging area. Keep the platform API key and source files off the preview host.
-3. Once implemented and explicitly authorized for a bounded cloud budget, provision a uniquely identified, temporary ECS with restricted access. Exercise chapter navigation, interactions, mobile layout and console errors against the deployed snapshot. Record the snapshot digest, device/viewport and results.
-4. Destroy only demonstrably run-owned resources. Independently query the correct cloud account and region until all billable resources are confirmed absent; an error, partial apply, lost state, unknown ownership or incomplete inventory is not success. Retain recovery records on failure or interruption.
-5. Only after success, upload the same snapshot locally using an authorized author key and specified existing book ID. A successful upload is not approval or publication. The temporary static preview is not the platform's restricted reader: separately test the actual platform reader and record that status.
+Install the Playwright package where the Node.js process can resolve it from the installed skill's `scripts` directory. For example, from the installed skill directory run `npm install --no-save --no-package-lock playwright`, then `npx playwright install chromium`. Alternatively, install Playwright in an accessible Node module directory and set `NODE_PATH` to that directory; global npm packages are not automatically resolved on every platform. An existing Chromium-compatible executable can be selected with `--browser-executable`. Installing Playwright does not install Terraform or the other prerequisites.
 
-## Prototype preparation
-
-Python 3.9 or newer is required. From this repository's root:
+Example environment setup in Bash (obtain credentials through your usual secure local method):
 
 ```bash
-python skills/smartbook-author/scripts/smartbook.py validate /path/to/book.zip
-python skills/smartbook-author/scripts/cloud_pipeline.py prepare /path/to/book.zip --run-dir /path/to/new-run-directory
+export SMARTBOOK_AUTO_DEPLOY=/path/to/auto-deploy
+export SMARTBOOK_CLOUD_REGION=cn-north-4
+export SMARTBOOK_CLOUD_CIDR=203.0.113.10/32
 ```
 
-Preparation validates and copies the ZIP, makes a preview staging directory and writes its digest. The target directory must not already exist. The directory is internal working material, not an independently authenticated audit record; protect it from modification, and do not publish it without checking for private data. `execute --simulation` is for tests using a fake adapter; its success cannot authorize an upload. The previous standalone uploader remains available for separate workflows, but does not satisfy the cloud-testing requirement.
+## Run the workflow
 
-## Recovery and limits
+Resolve these script paths relative to the installed skill directory. Start with a complete, locally validated ZIP. Choose a new run directory; it retains the exact ZIP snapshot, Terraform state and reports.
 
-No temporary ECS has been created or tested by this prototype. Local tests cannot establish Huawei IAM permissions, costs, resource inventory completeness, browser behavior or actual destruction. If a future run fails after any cloud request, retain the complete run directory and inspect the cloud console for all potentially created resources; do not destroy resources of uncertain ownership. Resume only after independently establishing ownership and cleanup. Never expose API keys in logs, URLs, screenshots, or generated assets.
+The pinned auto-deploy upload omits any path component named `.git`, `.auto-deploy`, `node_modules`, `.venv`, `venv`, `target`, `build`, `dist`, or `.env`. Preparation rejects an archive containing these components; rename those paths in the book and update references before packaging again. This additional temporary-deployment constraint is separate from the platform's ZIP validation rules.
+
+```bash
+python scripts/smartbook.py validate /path/to/book.zip
+python scripts/cloud_pipeline.py prepare /path/to/book.zip --run-dir /path/to/new-run
+python scripts/cloud_pipeline.py staged-start --run-dir /path/to/new-run
+```
+
+`staged-start` prints the preview endpoint and snapshot SHA-256. Create a JSON scenario containing interactions relevant to this particular book. Each `expect_visible` element must be hidden before the click and visible afterwards:
+
+```json
+{"steps":[{"name":"Open chapter two","click":"#chapter-2","expect_visible":"#chapter-2-content"}]}
+```
+
+Run the checks, then validate the report and destroy the temporary resources. Use the endpoint returned by `staged-start`; `--browser-executable` may point to an installed Chromium-compatible browser.
+
+```bash
+python scripts/browser_verify.py --run-dir /path/to/new-run --url http://PREVIEW_IP:5000/ --scenario /path/to/scenario.json
+python scripts/cloud_pipeline.py staged-verify --run-dir /path/to/new-run
+python scripts/cloud_pipeline.py staged-cleanup --run-dir /path/to/new-run
+python scripts/cloud_pipeline.py upload --run-dir /path/to/new-run --book-id 123 --base-url http://example.com:5173
+```
+
+The browser check covers the supplied interactions at desktop and mobile sizes, horizontal overflow, failed requests, console errors and the served index. It does not establish that every chapter, interaction, animation, or target-reader restriction works. The harness should inspect all chapters and test the platform reader separately. On a browser or verification failure, still run `staged-cleanup`; uploading remains unavailable until verification and cleanup succeed. Upload uses the same ZIP digest, preserves the idempotency key for retries, and does not approve or publish the book.
+
+## Cleanup and recovery
+
+The deployer creates billable resources. `staged-cleanup` invokes upstream `destroy.py` against this run's Terraform state and checks the state has no remaining managed instances. This is reported as `terraform_state_empty`, not an independent cloud-side inventory; check the Huawei Cloud console for residual resources, especially after interruption or partial provisioning. The working directory may contain private keys and state: retain it for recovery and do not publish it.
+
+If deployment is interrupted, first ensure its deploy, SSH and Terraform processes have stopped, then set `SMARTBOOK_RECOVERY_PROCESSES_STOPPED=yes` and run `staged-cleanup`. If ownership cannot be determined or cleanup fails, inspect the retained work directory and cloud resources; do not claim the run has been cleaned. Re-run cleanup after resolving the issue. The original direct uploader remains available for workflows that did not request cloud testing.

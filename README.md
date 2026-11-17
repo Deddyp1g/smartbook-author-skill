@@ -64,6 +64,12 @@ python skills/smartbook-author/scripts/upload.py /path/to/smartbook.zip --book-i
 
 当前智慧书阅读器未启用存储桥，原生 `localStorage` 也可能不可用；智慧书应在不能保存主题和阅读位置时仍可正常使用。随技能保留的存储客户端仅供未来支持该协议时实验，不能作为当前阅读器的持久化方案；详见 [存储说明](skills/smartbook-author/references/storage.md)。
 
+## 临时云端验证（实验中）
+
+本仓库正在集成独立的 [auto-deploy 参考项目](https://gitcode.com/weixin_43883336/auto-deploy)，目标是在临时华为云 ECS 上验证智慧书、回收资源后上传相同的 ZIP。当前只提供快照准备和模拟流程，**真实云端部署入口尚未开放**：还需完成浏览器交互验收、云资源归属与独立删除核验。模拟通过不代表真实云资源已销毁，也不能解锁上传。详细边界和准备方法见 [云端验证说明](skills/smartbook-author/references/cloud-testing.md)。
+
+参考项目未随本仓库分发；检查时其仓库未包含许可证，请在使用前自行确认适用条款。本项目 MIT 许可不覆盖该参考项目。平台实际阅读器的受限环境还需单独验证；平台审核仍由管理员进行。
+
 开发者可在仓库根目录运行 `python -m unittest discover -s tests -v` 和 `node --test tests/test_storage.cjs` 验证打包工具和存储客户端；后者需要 Node.js。
 
 ## 兼容性与许可
